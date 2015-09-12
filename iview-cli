@@ -168,10 +168,10 @@ def batch_fetch_program(episode, series):
     # urls also have '.mp4' extension but downloaded files end in '.flv'
     (base, ext) = os.path.splitext(filepart)
     
-    if batch_subtitles or subtitles_only:
-        subtitles(base.rsplit("_",1)[0])
     title = episode['title']
     filename = iview.fetch.descriptive_filename(series, title, url)
+    if batch_subtitles or subtitles_only:
+        subtitles(base.rsplit("_",1)[0], filename.replace('.flv', '.srt'))
     if os.path.isfile(base + '.flv') and not os.path.isfile(filename):
         print("{} already exists as {}.flv so should be moved".format(filename, base))
         return
