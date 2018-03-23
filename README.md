@@ -158,7 +158,7 @@ Credit
 ======
 
 2009-2011	Jeremy Visser <jeremy@visser.name>  
-2011-	Martin Panter <vadmium@gmail.com>  
-2014-	Scott Ramsay <scottramsay64@gmail.com>  
+2011-2015	Martin Panter <vadmium@gmail.com>  
+2014-2016	Scott Ramsay <scottramsay64@gmail.com>  
 
 :wq
