@@ -107,9 +107,13 @@ def batch(batch_file):
     batch.read(os.path.expanduser(batch_file))
     items = batch.items('batch')
 
+    global batch_subtitles
+    global subtitles_only
     batch_destination = '.'
     series_ids = []
     last_only = False
+    batch_subtitles = False
+    subtitles_only = False
 
     # separate options from the series ids
     for key, value in items:
@@ -118,6 +122,12 @@ def batch(batch_file):
         elif key == 'last_only':
             if not(value == '0' or value.lower() == 'false' or value.lower() == "no"):
                 last_only = True
+        elif key == 'subtitles':
+            if not(value == '0' or value.lower() == 'false' or value.lower() == "no"):
+                batch_subtitles = True
+        elif key == 'subtitles_only':
+            if not(value == '0' or value.lower() == 'false' or value.lower() == "no"):
+                subtitles_only = True
         else:
             # Note: currently the value after the series_id in the batch file
             # is only used as a comment for the user.
@@ -157,17 +167,20 @@ def batch_fetch_program(episode, series):
 
     # urls also have '.mp4' extension but downloaded files end in '.flv'
     (base, ext) = os.path.splitext(filepart)
-
+    
     title = episode['title']
     filename = iview.fetch.descriptive_filename(series, title, url)
+    if batch_subtitles or subtitles_only:
+        subtitles(base.rsplit("_",1)[0], filename.replace('.flv', '.srt'))
     if os.path.isfile(base + '.flv') and not os.path.isfile(filename):
         print("{} already exists as {}.flv so should be moved".format(filename, base))
         return
 
     if not os.path.isfile(filename):
         msg = "getting {} - {} -> {}".format(episode['title'], episode['url'], filename)
-        print(msg, file=stderr)
-        iview.fetch.fetch_program(episode['url'], execvp=False, dest_file=filename, quiet=True)
+        if not subtitles_only:
+            print(msg, file=stderr)
+            iview.fetch.fetch_program(episode['url'], execvp=False, dest_file=filename, quiet=True)
 
 
 
