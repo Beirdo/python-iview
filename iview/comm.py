@@ -45,7 +45,11 @@ def maybe_fetch(url, type=None, headers=()):
     """
 
     if not config.cache:
-        return fetch_url(url, type, headers=headers)
+        try:
+            return fetch_url(url, type, headers=headers)
+        except Exception as e:
+            print("Exception getting url %s: %s" % (url, e))
+            return None
 
     if not os.path.isdir(config.cache):
         os.mkdir(config.cache)
@@ -79,8 +83,9 @@ def get_config(headers=()):
     iview_config = dict(headers=headers)
     
     xml = maybe_fetch(config.config_url, ("application/xml", "text/xml"))
-    parsed = parser.parse_config(xml)
-    iview_config.update(parsed)
+    if xml:
+        parsed = parser.parse_config(xml)
+        iview_config.update(parsed)
 
 def get_auth():
     """This function performs an authentication handshake with iView.
