@@ -6,7 +6,9 @@ import imp
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 import sys
-from io import BytesIO, TextIOWrapper, StringIO
+from io import BytesIO, TextIOWrapper, BufferedReader
+from iview.utils import fastforward
+from errno import ECONNREFUSED
 
 try:  # Python 3.4
     from importlib import reload
@@ -25,8 +27,7 @@ class TestCli(TestCase):
             def get_captions(url):
                 return "dummy captions"
         
-        with substattr(self.iview_cli.iview, "comm", comm), \
-        substattr(self.iview_cli, "stderr", StringIO()), \
+        with substattr(self.iview_cli.iview, comm), \
         TemporaryDirectory(prefix="python-iview.") as dir:
             output = os.path.join(dir, "programme.srt")
             self.iview_cli.subtitles("programme.mp4", output)
@@ -40,6 +41,38 @@ class TestCli(TestCase):
             proxy = "localhost:1080"
             self.assertIsNone(self.iview_cli.parse_proxy_argument(proxy),
                 "Proxy setup failed")
+    
+    def test_batch(self):
+        with TemporaryDirectory(prefix="python-iview.") as dir:
+            batch = os.path.join(dir, "batch.cfg")
+            with open(batch, "w", encoding="ascii") as file:
+                file.write(
+                    "[batch]\n"
+                    "destination: {}\n"
+                    "100: Description ignored\n".format(dir)
+                )
+            class comm:
+                def get_config():
+                    pass
+                def get_series_items(id, get_meta):
+                    items = (dict(url="programme.mp4", title="Dummy title"),)
+                    return (items, dict(title="Dummy series"))
+            def fetch_program(url, *, execvp, dest_file, quiet):
+                nonlocal fetched
+                fetched = dest_file
+            with substattr(self.iview_cli.iview, comm), \
+            substattr(self.iview_cli.iview.fetch, fetch_program):
+                self.addCleanup(os.chdir, os.getcwd())
+                
+                fetched = None
+                self.iview_cli.batch(batch)
+                self.assertEqual("Dummy series - Dummy title.flv", fetched)
+                
+                with open(fetched, "wb"):
+                    pass
+                fetched = None
+                self.iview_cli.batch(batch)
+                self.assertIsNone(fetched, "Programme downloaded twice")
 
 class TestF4v(TestCase):
     def test_read_box(self):
@@ -54,7 +87,10 @@ class TestF4v(TestCase):
 class TestGui(TestCase):
     def setUp(self):
         path = os.path.join(os.path.dirname(__file__), "iview-gtk")
-        self.iview_gtk = load_script(path, "iview-gtk")
+        try:
+            self.iview_gtk = load_script(path, "iview-gtk")
+        except ImportError as err:
+            self.skipTest(err)
     
     def test_livestream(self):
         """Item with "livestream" (r) key but no "url" (n) key"""
@@ -101,6 +137,202 @@ class TestParse(TestCase):
             ("0000-00-00 00:00:00", None),  # QI series 6 episode 11
         ):
             self.assertEqual(expected, iview.parser.parse_date(input))
+    
+    def test_episodes(self):
+        import iview.parser
+        items = iview.parser.parse_json_feed(br'''['''
+            br'''{"seriesId": "100","seriesTitle": "Dummy Title",'''
+                br'''"title": "Series 1 Episode 1\n",'''  # Trailing newline
+                br'''"videoAsset": "/playback/_definst_/"},'''
+            br'''{"seriesId": "100","seriesTitle": "Dummy Title",'''
+                br'''"title": "Series 1 Episode 2 \n(Final)",'''  # Space NL
+                br'''"videoAsset": "/playback/_definst_/"}]''')
+        for i in items:
+            self.assertNotIn("\n", i["title"])
+
+import iview.utils
+import urllib.request
+import http.client
+
+class TestPersistentHttp(TestCase):
+    def setUp(self):
+        TestCase.setUp(self)
+        self.connection = iview.utils.PersistentConnectionHandler()
+        self.addCleanup(self.connection.close)
+        self.session = urllib.request.build_opener(self.connection)
+
+class TestLoopbackHttp(TestPersistentHttp):
+    def setUp(self):
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        from threading import Thread
+        
+        class RequestHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            
+            self.close_connection = False
+            
+            def do_GET(handler):
+                handler.send_response(200)
+                handler.send_header("Content-Length", format(6))
+                handler.end_headers()
+                handler.wfile.write(b"body\r\n")
+                handler.close_connection = self.close_connection
+            
+            def do_POST(handler):
+                length = int(handler.headers["Content-Length"])
+                fastforward(handler.rfile, length)
+                
+                handler.send_response(200)
+                handler.send_header("Content-Length", format(6))
+                handler.end_headers()
+                handler.wfile.write(b"body\r\n")
+                handler.close_connection = self.close_connection
+            
+            self.handle_calls = 0
+            def handle(*pos, **kw):
+                self.handle_calls += 1
+                return BaseHTTPRequestHandler.handle(*pos, **kw)
+        
+        server = HTTPServer(("localhost", 0), RequestHandler)
+        self.addCleanup(server.server_close)
+        self.url = "http://localhost:{}".format(server.server_port)
+        thread = Thread(target=server.serve_forever)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        return TestPersistentHttp.setUp(self)
+
+    def test_reuse(self):
+        """Test existing connection is reused"""
+        with self.session.open(self.url + "/one") as response:
+            self.assertEqual(b"body\r\n", response.read())
+        self.assertEqual(1, self.handle_calls, "Server handle() not called")
+        
+        with self.session.open(self.url + "/two") as response:
+            self.assertEqual(b"body\r\n", response.read())
+        self.assertEqual(1, self.handle_calls, "Unexpected handle() call")
+    
+    def test_close_empty(self):
+        """Test connection closure seen as empty response"""
+        self.close_connection = True
+        
+        with self.session.open(self.url + "/one") as response:
+            self.assertEqual(b"body\r\n", response.read())
+        self.assertEqual(1, self.handle_calls,
+            "Server handle() not called for /one")
+        
+        # Idempotent request should be retried
+        with self.session.open(self.url + "/two") as response:
+            self.assertEqual(b"body\r\n", response.read())
+        self.assertEqual(2, self.handle_calls,
+            "Server handle() not called for /two")
+        
+        # Non-idempotent request should not be retried
+        with self.assertRaises(http.client.BadStatusLine):
+            self.session.open(self.url + "/post", b"data")
+        self.assertEqual(2, self.handle_calls,
+            "Server handle() retried for POST")
+    
+    def test_close_error(self):
+        """Test connection closure reported as connection error"""
+        self.close_connection = True
+        with self.session.open(self.url + "/one") as response:
+            self.assertEqual(b"body\r\n", response.read())
+        self.assertEqual(1, self.handle_calls,
+            "Server handle() not called for /one")
+        
+        data = b"3" * 3000000
+        with self.assertRaises(http.client.BadStatusLine):
+            self.session.open(self.url + "/two", data)
+        self.assertEqual(1, self.handle_calls,
+            "Server handle() retried for POST")
+
+class TestMockHttp(TestPersistentHttp):
+    def setUp(self):
+        super().setUp()
+        self.connection.conn_classes = dict(self.connection.conn_classes)
+        self.connection.conn_classes["mock"] = self.HTTPConnection
+
+class TestHttpSocket(TestMockHttp):
+    class HTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = TestHttpSocket.Socket(
+                b"HTTP/1.1 200 First response\r\n"
+                b"Content-Length: 12\r\n"
+                b"\r\n"
+                b"First body\r\n"
+                
+                b"HTTP/1.1 200 Second response\r\n"
+                b"Content-Length: 13\r\n"
+                b"\r\n"
+                b"Second body\r\n"
+            )
+    
+    class Socket:
+        def __init__(self, data):
+            self.reader = BufferedReader(BytesIO(data))
+            self.reader.close = lambda: None  # Avoid Python Issue 23377
+        def sendall(self, *pos, **kw):
+            pass
+        def close(self, *pos, **kw):
+            self.data = None
+        def makefile(self, *pos, **kw):
+            return self.reader
+    
+    def test_reuse(self):
+        """Test existing connection is reused"""
+        with self.session.open("mock://localhost/one") as response:
+            self.assertEqual(b"First body\r\n", response.read())
+        sock = self.connection._connection.sock
+        self.assertTrue(sock.reader, "Disconnected after first request")
+        
+        with self.session.open("mock://localhost/two") as response:
+            self.assertEqual(b"Second body\r\n", response.read())
+        self.assertIs(sock, self.connection._connection.sock,
+            "Socket connection changed")
+        self.assertTrue(sock.reader, "Disconnected after second request")
+    
+    def test_new_host(self):
+        """Test connecting to second host"""
+        with self.session.open("mock://localhost/one") as response:
+            self.assertEqual(b"First body\r\n", response.read())
+        sock1 = self.connection._connection.sock
+        self.assertTrue(sock1.reader, "Disconnected after first request")
+        
+        with self.session.open("mock://otherhost/two") as response:
+            self.assertEqual(b"First body\r\n", response.read())
+        sock2 = self.connection._connection.sock
+        self.assertIsNot(sock1, sock2, "Expected new socket connection")
+        self.assertTrue(sock2.reader, "Disconnected after second request")
+    
+    def test_response(self):
+        with self.session.open("mock://localhost/#fragment") as response:
+            pass
+        self.assertEqual("mock://localhost/", response.geturl())
+
+class TestHttpEstablishError(TestMockHttp):
+    """Connection establishment errors should not trigger a retry"""
+    class HTTPConnection(http.client.HTTPConnection):
+        def __init__(self, *pos, **kw):
+            self.connect_count = 0
+            super().__init__(*pos, **kw)
+        def connect(self):
+            self.connect_count += 1
+            raise self.connect_exception
+    
+    def test_refused(self):
+        exception = EnvironmentError(ECONNREFUSED, "Mock connection refusal")
+        self.HTTPConnection.connect_exception = exception
+        try:
+            self.session.open("mock://dummy")
+        except http.client.HTTPException:
+            raise
+        except EnvironmentError as err:
+            if err.errno != ECONNREFUSED:
+                raise
+        else:
+            self.fail("ECONNREFUSED not raised")
+        self.assertEqual(1, self.connection._connection.connect_count)
 
 import iview.comm
 
@@ -158,7 +390,7 @@ class TestProxy(TestCase):
             self.assertRaises(exception, iview.comm.get_auth)
         
         self.assertRaises(exception, hds.fetch,
-            "http://localhost/", "media path", "hdnea", dest_file=None)
+            "http://localhost/", "hdnea", dest_file=None)
 
 @contextmanager
 def substattr(obj, attr, *value):

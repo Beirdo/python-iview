@@ -1,47 +1,55 @@
 import zlib
 from io import BufferedIOBase
-from urllib.parse import quote_plus
-from io import SEEK_CUR
+from io import SEEK_CUR, SEEK_END
 import urllib.request
-from http.client import HTTPConnection
 import http.client
+from errno import EPIPE, ESHUTDOWN, ENOTCONN, ECONNRESET
+import builtins
+from urllib.parse import urlsplit
+
+py3p3_exceptions = ("ConnectionError", "ConnectionRefusedError",
+    "ConnectionAbortedError")
+for name in py3p3_exceptions:
+    if not hasattr(builtins, name):  # Python < 3.3
+        class DummyException(EnvironmentError):
+            pass
+        globals()[name] = DummyException
+
+DISCONNECTION_ERRNOS = {EPIPE, ESHUTDOWN, ENOTCONN, ECONNRESET}
 
 def xml_text_elements(parent, namespace=""):
-	"""Extracts text from Element Tree into a dict()
-	
-	Each key is the tag name of a child of the given parent element, and
-	the value is the text of that child. Only tags with no attributes are
-	included. If the "namespace" parameter is given, it should specify an
-	XML namespace enclosed in curly brackets {. . .}, and only tags in
-	that namespace are included."""
-	
-	d = dict()
-	for child in parent:
-		if child.tag.startswith(namespace) and not child.keys():
-			tag = child.tag[len(namespace):]
-			d[tag] = child.text or ""
-	return d
+    """Extracts text from Element Tree into a dict()
+    
+    Each key is the tag name of a child of the given parent element, and
+    the value is the text of that child. Only tags with no attributes are
+    included. If the "namespace" parameter is given, it should specify an
+    XML namespace enclosed in curly brackets {. . .}, and only tags in
+    that namespace are included."""
+    
+    d = dict()
+    for child in parent:
+        if child.tag.startswith(namespace) and not child.keys():
+            tag = child.tag[len(namespace):]
+            d[tag] = child.text or ""
+    return d
 
 def read_int(stream, size):
-    bytes = stream.read(size)
-    assert len(bytes) == size
+    bytes = read_strict(stream, size)
     return int.from_bytes(bytes, "big")
 
 def read_string(stream):
     buf = bytearray()
     while True:
-        b = stream.read(1)
-        assert b
+        b = read_strict(stream, 1)
         if not ord(b):
             return buf
         buf.extend(b)
 
-value_unsafe = '%+&;#'
-VALUE_SAFE = ''.join(chr(c) for c in range(33, 127)
-    if chr(c) not in value_unsafe)
-def urlencode_param(value):
-    """Minimal URL encoding for query parameter"""
-    return quote_plus(value, safe=VALUE_SAFE)
+def read_strict(stream, size):
+    data = stream.read(size)
+    if len(data) != size:
+        raise EOFError()
+    return data
 
 class CounterWriter(BufferedIOBase):
     def __init__(self, output):
@@ -76,19 +84,20 @@ class TeeWriter(BufferedIOBase):
 def streamcopy(input, output, length):
     assert length >= 0
     while length:
-        chunk = input.read(min(length, 0x10000))
-        assert chunk
+        chunk = read_strict(input, min(length, 0x10000))
         output.write(chunk)
         length -= len(chunk)
 
 def fastforward(stream, offset):
     assert offset >= 0
     if stream.seekable():
-        stream.seek(offset, SEEK_CUR)
+        pos = stream.seek(offset, SEEK_CUR)
+        if pos > stream.seek(0, SEEK_END):
+            raise EOFError()
+        stream.seek(pos)
     else:
         while offset:
-            chunk = stream.read(min(offset, 0x10000))
-            assert chunk
+            chunk = read_strict(stream, min(offset, 0x10000))
             offset -= len(chunk)
 
 class WritingReader(BufferedIOBase):
@@ -128,7 +137,15 @@ class PersistentConnectionHandler(urllib.request.BaseHandler):
         response.read()
     
     connection.close()  # Frees socket
+    
+    Currently does not reuse an existing connection if
+    two host names happen to resolve to the same Internet address.
     """
+    
+    conn_classes = {
+        "http": http.client.HTTPConnection,
+        "https": http.client.HTTPSConnection,
+    }
     
     def __init__(self, *pos, **kw):
         self._type = None
@@ -138,39 +155,62 @@ class PersistentConnectionHandler(urllib.request.BaseHandler):
         self._connection = None
     
     def default_open(self, req):
-        if req.type != "http":
+        if req.type not in self.conn_classes:
             return None
         
         if req.type != self._type or req.host != self._host:
             if self._connection:
                 self._connection.close()
-            self._connection = HTTPConnection(req.host,
-                *self._pos, **self._kw)
+            conn_class = self.conn_classes[req.type]
+            self._connection = conn_class(req.host, *self._pos, **self._kw)
             self._type = req.type
             self._host = req.host
         
         headers = dict(req.header_items())
+        self._attempt_request(req, headers)
         try:
-            return self._openattempt(req, headers)
-        except http.client.BadStatusLine as err:
-            # If the server closed the connection before receiving this
-            # request, the "http.client" module raises an exception with the
-            # "line" attribute set to repr("")!
-            if err.line != repr(""):
+            try:
+                response = self._connection.getresponse()
+            except EnvironmentError as err:  # Python < 3.3 compatibility
+                if err.errno not in DISCONNECTION_ERRNOS:
+                    raise
+                raise http.client.BadStatusLine(err) from err
+        except (ConnectionError, http.client.BadStatusLine):
+            idempotents = {
+                "GET", "HEAD", "PUT", "DELETE", "TRACE", "OPTIONS"}
+            if req.get_method() not in idempotents:
                 raise
-        self._connection.close()
-        return self._openattempt(req, headers)
-    
-    def _openattempt(self, req, headers):
-        """Attempt a request using any existing connection"""
-        self._connection.request(req.get_method(), req.selector, req.data,
-            headers)
-        response = self._connection.getresponse()
+            # Retry requests whose method indicates they are idempotent
+            self._connection.close()
+            response = None
+        else:
+            if response.status == http.client.REQUEST_TIMEOUT:
+                # Server indicated it did not handle request
+                response = None
+        if not response:
+            # Retry request
+            self._attempt_request(req, headers)
+            response = self._connection.getresponse()
         
         # Odd impedance mismatch between "http.client" and "urllib.request"
         response.msg = response.reason
-        
+        # HTTPResponse secretly already has a geturl() method, but needs a
+        # "url" attribute to be set
+        response.url = "{}://{}{}".format(req.type, req.host, req.selector)
         return response
+    
+    def _attempt_request(self, req, headers):
+        """Send HTTP request, ignoring broken pipe and similar errors"""
+        try:
+            self._connection.request(req.get_method(), req.selector,
+                req.data, headers)
+        except (ConnectionRefusedError, ConnectionAbortedError):
+            raise  # Assume connection was not established
+        except ConnectionError:
+            pass  # Continue and read server response if available
+        except EnvironmentError as err:  # Python < 3.3 compatibility
+            if err.errno not in DISCONNECTION_ERRNOS:
+                raise
     
     def close(self):
         if self._connection:
@@ -180,3 +220,42 @@ class PersistentConnectionHandler(urllib.request.BaseHandler):
         return self
     def __exit__(self, *exc):
         self.close()
+
+def http_get(session, url, types=None, *, headers=dict(), **kw):
+    headers = dict(headers)
+    if types is not None:
+        headers["Accept"] = ", ".join(types)
+    req = urllib.request.Request(url, headers=headers, **kw)
+    response = session.open(req)
+    try:
+        # Content negotiation does not make sense with local files
+        if urlsplit(response.geturl()).scheme != "file":
+            headers = response.info()
+            headers.set_default_type(None)
+            type = headers.get_content_type()
+            if types is not None and type not in types:
+                msg = "Unexpected content type {}"
+                raise TypeError(msg.format(type))
+        return response
+    except:
+        response.close()
+        raise
+
+def encodeerrors(text, textio, errors="replace"):
+    """Prepare a string with a fallback encoding error handler
+    
+    If the string is not encodable to the output stream,
+    the string is passed through a codec error handler."""
+    
+    encoding = getattr(textio, "encoding", None)
+    if encoding is None:
+        # TextIOBase, and therefore StringIO, etc,
+        # have an "encoding" attribute,
+        # despite not doing any encoding
+        return text
+    
+    try:
+        text.encode(encoding, textio.errors or "strict")
+    except UnicodeEncodeError:
+        text = text.encode(encoding, errors).decode(encoding)
+    return text

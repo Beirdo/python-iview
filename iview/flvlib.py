@@ -1,50 +1,66 @@
-from .utils import fastforward, CounterWriter
+from .utils import fastforward
 from struct import Struct
-from .utils import read_int
+from .utils import read_int, read_strict
 from .utils import setitem
+from io import SEEK_CUR
 
 def main():
     from sys import stdin
+    
+    def dump(dict):
+        items = ("{}: {!r}".format(n, v) for [n, v] in sorted(dict.items()))
+        return "; ".join(items)
+    
     flv = stdin.buffer
-    print("signature", flv.read(3))
-    (version, flags) = flv.read(2)
-    audio = bool(flags & 1 << 2)
-    video = bool(flags & 1 << 0)
-    print("version", version, "audio", audio, "video", video)
-    body = read_int(flv, 4)
-    fastforward(flv, body - 9)
+    print("header", dump(read_file_header(flv)))
     
     while True:
-        fastforward(flv, 4)  # Previous tag size
+        offset = flv.tell()
         tag = read_tag_header(flv)
         if tag is None:
             break
-        print(repr(tag))
+        print(offset, dump(tag))
         
         parser = tag_parsers.get(tag["type"])
         if parser:
             parsed = parser(flv, tag)
-            print(" ", repr(parsed))
-        fastforward(flv, tag["length"])
+            print(" ", dump(parsed))
+        fastforward(flv, tag["length"] + 4)  # Including trailing tag size
 
 def write_file_header(flv, audio=True, video=True):
-    counter = CounterWriter(flv)
-    counter.write(b"FLV")  # Signature
-    counter.write(bytes((1,)))  # File version
-    counter.write(bytes((audio << 2 | video << 0,)))
+    flv.write(SIGNATURE)
+    flv.write(bytes((FILE_VERSION,)))
+    flv.write(bytes((audio << 2 | video << 0,)))
+    flv.write(FILE_HEADER_LENGTH.to_bytes(4, "big"))  # Body offset
     
-    flv.write((counter.tell() + 4).to_bytes(4, "big"))  # Body offset
-    flv.write((0).to_bytes(4, "big"))  # Previous tag size
+    flv.write((0).to_bytes(4, "big"))  # Previous tag size field
+
+def read_file_header(flv):
+    signature = read_strict(flv, 3)
+    if signature != SIGNATURE:
+        raise ValueError(repr(signature))
+    (version, flags) = read_strict(flv, 2)
+    if version != FILE_VERSION:
+        raise ValueError(version)
+    body = read_int(flv, 4)
+    fastforward(flv, body - FILE_HEADER_LENGTH + 4)  # Skip prev. tag size
+    return dict(
+        audio=bool(flags & 1 << 2),
+        video=bool(flags & 1 << 0),
+    )
+
+SIGNATURE = b"FLV"
+FILE_VERSION = 1
+FILE_HEADER_LENGTH = len(SIGNATURE) + 2 + 4
 
 def write_scriptdata(flv, metadata):
-    counter = CounterWriter(flv)
-    counter.write(bytes((TAG_SCRIPTDATA,)))
-    counter.write(len(metadata).to_bytes(3, "big"))
-    counter.write((0).to_bytes(3, "big"))  # Timestamp
-    counter.write(bytes((0,)))  # Timestamp extension
-    counter.write((0).to_bytes(3, "big"))  # Stream id
-    counter.write(metadata)
-    flv.write(counter.tell().to_bytes(4, "big"))
+    flv.write(bytes((TAG_SCRIPTDATA,)))
+    flv.write(len(metadata).to_bytes(3, "big"))
+    flv.write((0).to_bytes(3, "big"))  # Timestamp
+    flv.write(bytes((0,)))  # Timestamp extension
+    flv.write((0).to_bytes(3, "big"))  # Stream id
+    flv.write(metadata)
+    flv.write((TAG_HEADER_LENGTH + len(metadata)).to_bytes(4, "big"))
 
 def read_tag_header(flv):
     flags = flv.read(1)
@@ -53,7 +69,7 @@ def read_tag_header(flv):
     (flags,) = flags
     length = read_int(flv, 3)
     timestamp = read_int(flv, 3)
-    (extension,) = SBYTE.unpack(flv.read(1))
+    (extension,) = SBYTE.unpack(read_strict(flv, 1))
     streamid = read_int(flv, 3)
     return dict(
         filter=bool(flags >> 5 & 1),
@@ -64,12 +80,22 @@ def read_tag_header(flv):
     )
 SBYTE = Struct("=b")
 
+TAG_HEADER_LENGTH = 1 + 3 + 3 + 1 + 3
+
+def read_prev_tag(flv):
+    flv.seek(-4, SEEK_CUR)
+    length = read_int(flv, 4)
+    if not length:
+        return None
+    flv.seek(-4 - length, SEEK_CUR)
+    return read_tag_header(flv)
+
 tag_parsers = dict()
 
 TAG_AUDIO = 8
 @setitem(tag_parsers, TAG_AUDIO)
 def parse_audio_tag(flv, tag):
-    (flags,) = flv.read(1)
+    (flags,) = read_strict(flv, 1)
     tag["length"] -= 1
     result = dict(
         format=flags >> 4 & 0xF,
@@ -78,7 +104,7 @@ def parse_audio_tag(flv, tag):
         type=flags >> 0 & 1,
     )
     if result["format"] == FORMAT_AAC:
-        (result["aac_type"],) = flv.read(1)
+        (result["aac_type"],) = read_strict(flv, 1)
         tag["length"] -= 1
     return result
 
@@ -88,14 +114,14 @@ AAC_HEADER = 0
 TAG_VIDEO = 9
 @setitem(tag_parsers, TAG_VIDEO)
 def parse_video_tag(flv, tag):
-    (flags,) = flv.read(1)
+    (flags,) = read_strict(flv, 1)
     tag["length"] -= 1
     result = dict(
         frametype=flags >> 4 & 0xF,
         codecid=flags >> 0 & 0xF,
     )
     if result["codecid"] == CODEC_AVC:
-        (result["avc_type"],) = flv.read(1)
+        (result["avc_type"],) = read_strict(flv, 1)
         tag["length"] -= 1
     return result
 
@@ -119,7 +145,7 @@ scriptdatavalue_parsers = dict()
 
 @setitem(scriptdatavalue_parsers, 0)
 def parse_number(stream):
-    (number,) = DOUBLE_BE.unpack(stream.read(DOUBLE_BE.size))
+    (number,) = DOUBLE_BE.unpack(read_strict(stream, DOUBLE_BE.size))
     return number
 DOUBLE_BE = Struct(">d")
 
@@ -130,9 +156,7 @@ def parse_boolean(stream):
 @setitem(scriptdatavalue_parsers, 2)
 def parse_string(stream):
     length = read_int(stream, 2)
-    string = stream.read(length)
-    assert len(string) == length
-    return string
+    return read_strict(stream, length)
 
 @setitem(scriptdatavalue_parsers, 3)
 def parse_object(stream):
