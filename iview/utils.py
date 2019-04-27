@@ -225,6 +225,7 @@ def http_get(session, url, types=None, *, headers=dict(), **kw):
     headers = dict(headers)
     if types is not None:
         headers["Accept"] = ", ".join(types)
+    print(url)
     req = urllib.request.Request(url, headers=headers, **kw)
     response = session.open(req)
     try:
