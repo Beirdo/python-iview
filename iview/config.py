@@ -34,7 +34,7 @@ akamaihd_player = "7ob1gDzeD6B33Q6WHsCoIlv6HQhCmcM4WGc36Y6bD+Q="
 # Default configuration for SOCKS proxy.  If host is specified
 # as 'None' then no proxy will be used.  The default port number
 # will be used if only a host name is specified for the proxy.
-socks_proxy_host = None
+socks_proxy_host = "localhost"
 socks_proxy_port = 1080
 
 # Cache directory to use for debugging
